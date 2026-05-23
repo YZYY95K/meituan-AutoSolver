@@ -1,15 +1,14 @@
 """
-AutoSolver: AI Agent 自主求解配送分配问题
+AutoSolver v11: 双模型优化版
 ==========================================
-美团 AI Hackathon 2026 | 命题赛道四
-
-设计要点：
-- 80个骑手、40个任务、~33K候选行；双任务key占~90%
-- willingness 均值仅 0.30 —— 单骑手派单平均 70% 没人接，是首要矛盾
-- 输出 [(task_key, [courier_id, ...])] 支持多骑手分派（最先接起者获得订单）
-- 目标函数：E[cost] = w·score + (1-w)·penalty·n_tasks
-- 流程：(1) 主骑手贪心覆盖全部任务 (2) 用剩余骑手做 backup 降拒单率
-- penalty 的真值未知，扫描多个候选值取最优
+核心改动：
+1. 用顺序接单模型(score_asc排序)作为主要评估口径
+2. 同时保留加权平均模型评估，取双模型最优
+3. 减少时间缓冲到0.8s
+4. 更细粒度penalty扫描
+5. 启用random策略
+6. repair后添加backup
+7. 骑手排序优化：输出前按score升序排列（顺序接单模型最优）
 """
 
 from collections import defaultdict
@@ -65,12 +64,92 @@ def _baseline_greedy(input_text: str) -> list:
     return out
 
 
+# ============================================================
+# 两种 slot_cost 模型
+# ============================================================
+def _slot_cost_ordered(tk, cids, cand_map, penalty):
+    """顺序接单模型：骑手按列表顺序尝试接单。
+    E[cost] = sum_k [P(k接单) * score_k] + P(全部拒单) * penalty * n
+    """
+    if not cids:
+        return penalty * 100
+    first_c = cand_map.get((tk, cids[0]))
+    if not first_c:
+        return penalty * 100
+    n = len(first_c["task_ids"])
+
+    p_all_rej = 1.0
+    expected_score = 0.0
+    for cid in cids:
+        c = cand_map.get((tk, cid))
+        if c:
+            w = c["willingness"]
+            p_k_accept = w * p_all_rej
+            expected_score += p_k_accept * c["score"]
+            p_all_rej *= (1 - w)
+
+    p_any_accept = 1 - p_all_rej
+    return p_any_accept * expected_score + p_all_rej * penalty * n
+
+
+def _slot_cost_weighted(tk, cids, cand_map, penalty):
+    """加权平均模型（v9safe原始版本）"""
+    if not cids:
+        return penalty * 100
+    first_c = cand_map.get((tk, cids[0]))
+    if not first_c:
+        return penalty * 100
+    n = len(first_c["task_ids"])
+    p_rej = 1.0
+    sum_w = 0.0
+    sum_ws = 0.0
+    for cid in cids:
+        c = cand_map.get((tk, cid))
+        if c:
+            p_rej *= (1 - c["willingness"])
+            sum_w += c["willingness"]
+            sum_ws += c["willingness"] * c["score"]
+    avg = sum_ws / sum_w if sum_w > 0 else 0.0
+    return (1 - p_rej) * avg + p_rej * penalty * n
+
+
+def _m5_total_ordered(assignments, cand_map, all_tasks, penalty):
+    """顺序接单模型的整解M5成本"""
+    total = 0.0
+    covered = set()
+    for tk, cids in assignments:
+        if not cids:
+            continue
+        total += _slot_cost_ordered(tk, cids, cand_map, penalty)
+        c = cand_map.get((tk, cids[0]))
+        if c:
+            for t in c["task_ids"]:
+                covered.add(t)
+    total += (len(all_tasks) - len(covered)) * penalty
+    return total
+
+
+def _m5_total_weighted(assignments, cand_map, all_tasks, penalty):
+    """加权平均模型的整解M5成本"""
+    total = 0.0
+    covered = set()
+    for tk, cids in assignments:
+        if not cids:
+            continue
+        total += _slot_cost_weighted(tk, cids, cand_map, penalty)
+        c = cand_map.get((tk, cids[0]))
+        if c:
+            for t in c["task_ids"]:
+                covered.add(t)
+    total += (len(all_tasks) - len(covered)) * penalty
+    return total
+
+
 def _solve_main(input_text: str) -> list:
-    """主算法：willingness 加权 + 多骑手 backup，扫描多个 penalty 值 + ALNS。"""
+    """主算法：双模型评估 + 多策略 + ALNS"""
     import time
     start_ts = time.time()
-    # 留 2.5s 缓冲给判题机延迟和未跟踪的步骤。10s 限时 -> 7.5s 内部 deadline
-    deadline = start_ts + 7.5
+    deadline = start_ts + 9.2  # 0.8s缓冲
 
     candidates = _parse_input(input_text)
     if not candidates:
@@ -87,15 +166,18 @@ def _solve_main(input_text: str) -> list:
         taskkey_to_cands[c["task_key"]].append(c)
         cand_map[(c["task_key"], c["courier_id"])] = c
 
-    # 扫描 penalty 值（赛题未公开），各取最优方案
-    best_assignments = None
-    best_metric = float("inf")
-    best_covered = 0
+    # 对每个penalty和策略，生成候选方案
+    # 用两种模型评估，分别保存最优
+    best_ordered = None
+    best_ordered_metric = float("inf")
+    best_weighted = None
+    best_weighted_metric = float("inf")
 
-    # 4 种 primary 策略 × 5 penalty = 20 个候选；按 M5@100 选最优（v5 的子集）
-    strategies = ("global", "hard_first", "doubles_first")
+    strategies = ("global", "hard_first", "doubles_first", "random")
+    penalties = (60, 80, 100, 120, 150, 200, 300)
+
     for primary_strategy in strategies:
-        for penalty in (60, 100, 150, 200, 300):
+        for penalty in penalties:
             if primary_strategy == "global":
                 primary = _pick_primary(candidates, all_tasks, penalty)
             elif primary_strategy == "hard_first":
@@ -106,27 +188,25 @@ def _solve_main(input_text: str) -> list:
                 primary = _pick_primary_random(candidates, all_tasks, penalty)
             primary = _rescue_coverage(primary, candidates, all_tasks, cand_map)
 
-            covered = set()
-            for tk, cid in primary:
-                c = cand_map.get((tk, cid))
-                if c:
-                    for t in c["task_ids"]:
-                        covered.add(t)
-
             assignments = _add_backups(primary, all_couriers, taskkey_to_cands, cand_map, penalty)
             assignments = _local_swap(assignments, taskkey_to_cands, cand_map, penalty)
 
-            # 用判题真值 penalty=100 统一评估每个候选（v1 用各自 penalty 算 metric
-            # 不可比；用 p=100 重评保证选到判题口径下真正的最优）
-            metric = _expected_cost(assignments, cand_map, 100)
-            uncovered = len(all_tasks) - len(covered)
-            metric += uncovered * 100  # 未覆盖任务的判题 penalty
-            if metric < best_metric:
-                best_metric = metric
-                best_assignments = assignments
-                best_covered = len(covered)
+            # 用score_asc排序（顺序接单模型最优）
+            assignments_sorted = _sort_cids_score_asc(assignments, cand_map)
 
-    # 兜底：用 baseline 作为额外候选；如果 baseline 覆盖更多，用 baseline
+            # 顺序接单模型评估
+            metric_ordered = _m5_total_ordered(assignments_sorted, cand_map, all_tasks, penalty)
+            if metric_ordered < best_ordered_metric:
+                best_ordered_metric = metric_ordered
+                best_ordered = [(tk, list(cids)) for tk, cids in assignments_sorted]
+
+            # 加权平均模型评估（排序不影响）
+            metric_weighted = _m5_total_weighted(assignments, cand_map, all_tasks, penalty)
+            if metric_weighted < best_weighted_metric:
+                best_weighted_metric = metric_weighted
+                best_weighted = [(tk, list(cids)) for tk, cids in assignments]
+
+    # 兜底：baseline
     baseline_out = _baseline_greedy(input_text)
     baseline_covered = set()
     for tk, cids in baseline_out:
@@ -136,40 +216,80 @@ def _solve_main(input_text: str) -> list:
                 for t in c["task_ids"]:
                     baseline_covered.add(t)
 
-    if not best_assignments or len(baseline_covered) > best_covered:
-        # baseline 覆盖更多 → 用 baseline 作底，然后跑 backup/local_swap 优化
+    if len(baseline_covered) >= 40:
         primary_from_baseline = [(tk, cids[0]) for tk, cids in baseline_out if cids]
         assignments = _add_backups(primary_from_baseline, all_couriers, taskkey_to_cands, cand_map, 100)
         assignments = _local_swap(assignments, taskkey_to_cands, cand_map, 100)
-        best_assignments = assignments
+        assignments_sorted = _sort_cids_score_asc(assignments, cand_map)
+        m = _m5_total_ordered(assignments_sorted, cand_map, all_tasks, 100)
+        if m < best_ordered_metric:
+            best_ordered_metric = m
+            best_ordered = [(tk, list(cids)) for tk, cids in assignments_sorted]
+        m2 = _m5_total_weighted(assignments, cand_map, all_tasks, 100)
+        if m2 < best_weighted_metric:
+            best_weighted_metric = m2
+            best_weighted = [(tk, list(cids)) for tk, cids in assignments]
 
-    if not best_assignments:
+    # inter_swap: 对两种模型的最优解都做
+    if best_ordered:
+        best_ordered = _inter_swap_ordered(best_ordered, all_couriers, taskkey_to_cands, cand_map, 100)
+    if best_weighted:
+        best_weighted = _inter_swap_weighted(best_weighted, all_couriers, taskkey_to_cands, cand_map, 100)
+
+    # ALNS: 对两种模型的最优解都做
+    if time.time() < deadline - 0.3:
+        if best_ordered:
+            best_ordered = _alns_ordered(
+                best_ordered, candidates, all_tasks, all_couriers,
+                cand_map, taskkey_to_cands, 100, deadline)
+        if best_weighted and time.time() < deadline - 0.3:
+            best_weighted = _alns_weighted(
+                best_weighted, candidates, all_tasks, all_couriers,
+                cand_map, taskkey_to_cands, 100, deadline)
+
+    # 选择两种模型中分数更好的（用各自模型评估）
+    # 但我们不知道判题用哪个模型，所以生成两个版本
+    # 策略：如果ordered分数更低（相对penalty），用ordered版本
+    # 否则用weighted版本
+    if best_ordered and best_weighted:
+        # 归一化比较：两个模型的绝对值不同，但都覆盖40任务
+        # 选择ordered版本（因为score_asc排序对两种模型都无害：
+        # - 对weighted模型，排序不影响分数
+        # - 对ordered模型，score_asc是最优排序
+        # 所以用ordered版本是安全的）
+        result = best_ordered
+    elif best_ordered:
+        result = best_ordered
+    elif best_weighted:
+        result = best_weighted
+    else:
         return []
 
-    # 最终 best_assignments 跑一次 inter-assignment swap + ADD（用判题真值的 penalty=100），
-    # 严格单调降 M5 成本；找不到改进就原样返回，不会回归
-    best_assignments = _inter_swap(
-        best_assignments, all_couriers, taskkey_to_cands, cand_map, 100)
+    # 最终排序：score_asc
+    result = _sort_cids_score_asc(result, cand_map)
 
-    # ALNS（Adaptive Large Neighborhood Search）：destroy + repair + 模拟退火接受准则
-    # 用剩余时间跳出 inter_swap 的局部最优。SA 允许有限度的"变差"接受，能跨越成本谷。
-    if time.time() < deadline - 0.3:
-        best_assignments = _alns(
-            best_assignments, candidates, all_tasks, all_couriers,
-            cand_map, taskkey_to_cands, 100, deadline)
-
-    # 转为输出格式 [(task_key, [courier_ids...]), ...]
-    return [(tk, list(cids)) for tk, cids in best_assignments]
+    return [(tk, list(cids)) for tk, cids in result]
 
 
+def _sort_cids_score_asc(assignments, cand_map):
+    """对每个task_key的骑手按score升序排列（顺序接单模型最优排序）"""
+    result = []
+    for tk, cids in assignments:
+        sorted_cids = sorted(cids, key=lambda cid: cand_map.get((tk, cid), {}).get("score", float("inf")))
+        result.append((tk, sorted_cids))
+    return result
+
+
+# ============================================================
+# Primary 策略
+# ============================================================
 def _pick_primary_hard_first(candidates, all_tasks, penalty):
-    """难任务优先：候选最少的任务先选骑手，避免被全局贪心挤掉。"""
+    """难任务优先"""
     task_to_cands = {}
     for c in candidates:
         for t in c["task_ids"]:
             task_to_cands.setdefault(t, []).append(c)
 
-    # 任务按候选数升序排序
     task_order = sorted(all_tasks, key=lambda t: len(task_to_cands.get(t, [])))
 
     used_c = set()
@@ -178,7 +298,6 @@ def _pick_primary_hard_first(candidates, all_tasks, penalty):
     for task in task_order:
         if task in used_t:
             continue
-        # 候选按 per-task cost 升序
         cands_for_task = []
         for c in task_to_cands.get(task, []):
             if c["courier_id"] in used_c:
@@ -203,14 +322,12 @@ def _pick_primary_hard_first(candidates, all_tasks, penalty):
 
 
 def _pick_primary_doubles_first(candidates, all_tasks, penalty):
-    """双任务候选优先：n>=2 排在 singles 之前，再按每任务期望成本升序。
-    在骑手稀缺场景下能挤出更多覆盖（一个骑手覆盖 2 个任务）。"""
+    """双任务候选优先"""
     enriched = []
     for c in candidates:
         n = len(c["task_ids"])
         w = c["willingness"]
         per_task_cost = (w * c["score"] + (1 - w) * penalty * n) / n
-        # priority: doubles (0) before singles (1)
         enriched.append(((0 if n >= 2 else 1, per_task_cost), c))
     enriched.sort(key=lambda x: x[0])
 
@@ -233,15 +350,14 @@ def _pick_primary_doubles_first(candidates, all_tasks, penalty):
 
 
 def _pick_primary_random(candidates, all_tasks, penalty):
-    """全局贪心 + 固定种子随机扰动 tiebreak。打破 ties 探索不同组合。"""
+    """全局贪心 + 随机扰动"""
     import random
-    rng = random.Random(42 + int(penalty))  # 每个 penalty 用不同种子
+    rng = random.Random(42 + int(penalty))
     enriched = []
     for c in candidates:
         n = len(c["task_ids"])
         w = c["willingness"]
         per_task_cost = (w * c["score"] + (1 - w) * penalty * n) / n
-        # 添加 [0, 0.5) 的随机扰动；不会改变粗排序，只打破相近 ties
         enriched.append((per_task_cost + rng.random() * 0.5, c))
     enriched.sort(key=lambda x: x[0])
 
@@ -264,7 +380,7 @@ def _pick_primary_random(candidates, all_tasks, penalty):
 
 
 def _rescue_coverage(primary, candidates, all_tasks, cand_map):
-    """如果 primary 没覆盖全部任务，挨个补任何可用候选（含双任务），骑手不重用。"""
+    """补全未覆盖任务"""
     covered = set()
     used_couriers = set()
     for tk, cid in primary:
@@ -278,7 +394,6 @@ def _rescue_coverage(primary, candidates, all_tasks, cand_map):
     if not uncovered:
         return primary
 
-    # 按任务可选候选数升序处理（最稀缺的任务先救）
     task_to_cands = {}
     for c in candidates:
         for t in c["task_ids"]:
@@ -290,28 +405,24 @@ def _rescue_coverage(primary, candidates, all_tasks, cand_map):
     for task in uncov_order:
         if task in covered:
             continue
-        # 找该任务的可用候选；优先单任务（不浪费双任务额度），再 score 升序
         candidates_for_task = []
         for c in task_to_cands.get(task, []):
             if c["courier_id"] in used_couriers:
                 continue
-            # 跳过会浪费已覆盖任务的双任务候选
             other_tasks = [t for t in c["task_ids"] if t != task]
             if any(t in covered for t in other_tasks):
                 continue
             candidates_for_task.append(c)
 
         if not candidates_for_task:
-            # 退而求其次：允许覆盖已覆盖任务（浪费但能覆盖当前 task）
             for c in task_to_cands.get(task, []):
                 if c["courier_id"] in used_couriers:
                     continue
                 candidates_for_task.append(c)
 
         if not candidates_for_task:
-            continue  # 真的覆盖不了
+            continue
 
-        # 选 score 最低的（救火不计 willingness）
         best = min(candidates_for_task, key=lambda c: c["score"])
         extended.append((best["task_key"], best["courier_id"]))
         used_couriers.add(best["courier_id"])
@@ -322,15 +433,11 @@ def _rescue_coverage(primary, candidates, all_tasks, cand_map):
 
 
 def _pick_primary(candidates, all_tasks, penalty):
-    """贪心：每个 candidate 算"每任务期望代价"，按升序选不冲突的。"""
+    """贪心：按每任务期望代价升序选不冲突的"""
     enriched = []
     for c in candidates:
         n = len(c["task_ids"])
         w = c["willingness"]
-        # 单 candidate 的"每任务期望代价"
-        # 接单（概率 w）：score 由此骑手承担
-        # 拒单（概率 1-w）：n 个任务都失败 → 罚 penalty·n
-        # 摊到每任务 = (w·score + (1-w)·penalty·n) / n
         per_task_cost = (w * c["score"] + (1 - w) * penalty * n) / n
         enriched.append((per_task_cost, c))
     enriched.sort(key=lambda x: x[0])
@@ -353,20 +460,20 @@ def _pick_primary(candidates, all_tasks, penalty):
     return out
 
 
+# ============================================================
+# Backup + Local Search (用加权平均模型，与v9safe一致)
+# ============================================================
 def _add_backups(primary, all_couriers, taskkey_to_cands, cand_map, penalty):
-    """对每个 primary 分派，迭代添加 backup 骑手，直到没有正收益。"""
-    # task_key -> [courier_id1, courier_id2, ...]，第一个是主骑手
-    assignments = []  # list of (tk, [cids]) — 保持有序以便后续局部搜索
-    tk_index = {}     # tk -> idx in assignments
+    """添加backup骑手"""
+    assignments = []
     used_couriers = set()
     for tk, cid in primary:
-        tk_index[tk] = len(assignments)
         assignments.append((tk, [cid]))
         used_couriers.add(cid)
 
     while True:
         best_gain = 1e-6
-        best_choice = None  # (idx, new_cid)
+        best_choice = None
 
         for idx, (tk, cids) in enumerate(assignments):
             first_c = cand_map.get((tk, cids[0]))
@@ -374,25 +481,20 @@ def _add_backups(primary, all_couriers, taskkey_to_cands, cand_map, penalty):
                 continue
             n_tasks = len(first_c["task_ids"])
 
-            # 当前拒单概率
             p_rej = 1.0
             for cid in cids:
                 cc = cand_map.get((tk, cid))
                 if cc:
                     p_rej *= (1 - cc["willingness"])
             if p_rej < 0.03:
-                continue  # 已经基本稳了
+                continue
 
-            # 尝试每个空闲骑手作为该 task_key 的 backup
             for c in taskkey_to_cands[tk]:
                 cid = c["courier_id"]
                 if cid in used_couriers:
                     continue
                 new_p_rej = p_rej * (1 - c["willingness"])
-                # 收益：少损失的期望罚分
                 penalty_gain = (p_rej - new_p_rej) * penalty * n_tasks
-                # 代价：c 成为最终接单者的期望 score
-                # 简化：P(c 是 winner) ≈ p_rej_before · c.w（只有前面都拒、c 接才 winner）
                 added_cost = c["score"] * c["willingness"] * p_rej
                 net = penalty_gain - added_cost
                 if net > best_gain:
@@ -410,14 +512,13 @@ def _add_backups(primary, all_couriers, taskkey_to_cands, cand_map, penalty):
 
 
 def _local_swap(assignments, taskkey_to_cands, cand_map, penalty):
-    """局部搜索：对每个分派，尝试把骑手替换成空闲骑手中期望代价更低的；尝试删除负收益备份。"""
+    """局部搜索（加权平均模型）"""
     used_couriers = set()
     for tk, cids in assignments:
         for cid in cids:
             used_couriers.add(cid)
 
     def slot_cost(tk, cids):
-        """该 task_key 当前的期望代价。"""
         if not cids:
             return penalty * 100
         first_c = cand_map.get((tk, cids[0]))
@@ -442,7 +543,6 @@ def _local_swap(assignments, taskkey_to_cands, cand_map, penalty):
         improved = False
         rounds += 1
 
-        # 替换：找空闲骑手替换 cids 中某一位
         for i, (tk, cids) in enumerate(assignments):
             current_cost = slot_cost(tk, cids)
             for pos in range(len(cids)):
@@ -462,12 +562,10 @@ def _local_swap(assignments, taskkey_to_cands, cand_map, penalty):
                     else:
                         cids[pos] = old_cid
 
-        # 删除负收益备份（最后一个开始）
         for i, (tk, cids) in enumerate(assignments):
             if len(cids) <= 1:
                 continue
             current_cost = slot_cost(tk, cids)
-            # 尝试逐一删除非首位骑手
             for pos in range(len(cids) - 1, 0, -1):
                 removed_cid = cids.pop(pos)
                 new_cost = slot_cost(tk, cids)
@@ -481,33 +579,14 @@ def _local_swap(assignments, taskkey_to_cands, cand_map, penalty):
     return assignments
 
 
-def _inter_swap(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
-    """单调局部搜索：SWAP / MOVE（跨分派）+ ADD（从空闲骑手池）。
-
-    判题真值口径（M5）：
-        slot_cost = (1-prod(1-w))*sum(w*s)/sum(w) + prod(1-w)*penalty*n
-    任意接受的移动都严格降总 M5 成本，因此不会回归。
-    """
+# ============================================================
+# Inter Swap (两种模型版本)
+# ============================================================
+def _inter_swap_weighted(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
+    """加权平均模型的inter_swap"""
     def slot_cost(tk, cids):
-        if not cids:
-            return penalty * 100
-        first_c = cand_map.get((tk, cids[0]))
-        if not first_c:
-            return penalty * 100
-        n = len(first_c["task_ids"])
-        p_rej = 1.0
-        sum_w = 0.0
-        sum_ws = 0.0
-        for cid in cids:
-            c = cand_map.get((tk, cid))
-            if c:
-                p_rej *= (1 - c["willingness"])
-                sum_w += c["willingness"]
-                sum_ws += c["willingness"] * c["score"]
-        avg = sum_ws / sum_w if sum_w > 0 else 0.0
-        return (1 - p_rej) * avg + p_rej * penalty * n
+        return _slot_cost_weighted(tk, cids, cand_map, penalty)
 
-    # 空闲骑手池：未被任何分派占用
     used = set()
     for tk, cids in assignments:
         for cid in cids:
@@ -521,7 +600,6 @@ def _inter_swap(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
         improved = False
         rounds += 1
 
-        # ---- SWAP / MOVE 跨分派对 ----
         for i in range(n_asgn):
             tk_i, cids_i = assignments[i]
             for j in range(n_asgn):
@@ -532,20 +610,13 @@ def _inter_swap(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
                 cj_before = slot_cost(tk_j, cids_j)
                 base = ci_before + cj_before
                 done = False
-                # SWAP: cids_i[px] <-> cids_j[py]
                 for px in range(len(cids_i)):
                     X = cids_i[px]
-                    if (tk_j, X) not in cand_map:
-                        continue
-                    if X in cids_j:
+                    if (tk_j, X) not in cand_map or X in cids_j:
                         continue
                     for py in range(len(cids_j)):
                         Y = cids_j[py]
-                        if X == Y:
-                            continue
-                        if (tk_i, Y) not in cand_map:
-                            continue
-                        if Y in cids_i:
+                        if X == Y or (tk_i, Y) not in cand_map or Y in cids_i:
                             continue
                         cids_i[px], cids_j[py] = Y, X
                         new_cost = slot_cost(tk_i, cids_i) + slot_cost(tk_j, cids_j)
@@ -558,14 +629,11 @@ def _inter_swap(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
                         break
                 if done:
                     continue
-                # MOVE: 把 cids_i[px] 挪到 cids_j（i 仍保留 ≥1）
                 if len(cids_i) <= 1:
                     continue
                 for px in range(len(cids_i)):
                     X = cids_i[px]
-                    if (tk_j, X) not in cand_map:
-                        continue
-                    if X in cids_j:
+                    if (tk_j, X) not in cand_map or X in cids_j:
                         continue
                     removed = cids_i.pop(px)
                     cids_j.append(X)
@@ -576,16 +644,13 @@ def _inter_swap(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
                     cids_j.pop()
                     cids_i.insert(px, removed)
 
-        # ---- ADD：从空闲池补备份骑手 ----
         for j in range(n_asgn):
             tk_j, cids_j = assignments[j]
             cj_before = slot_cost(tk_j, cids_j)
             best_gain = 0.0
             best_X = None
             for X in list(free):
-                if (tk_j, X) not in cand_map:
-                    continue
-                if X in cids_j:
+                if (tk_j, X) not in cand_map or X in cids_j:
                     continue
                 cids_j.append(X)
                 new_cost = slot_cost(tk_j, cids_j)
@@ -599,7 +664,6 @@ def _inter_swap(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
                 free.discard(best_X)
                 improved = True
 
-        # ---- REMOVE：删除非首位负收益备份 ----
         for j in range(n_asgn):
             tk_j, cids_j = assignments[j]
             if len(cids_j) <= 1:
@@ -618,57 +682,127 @@ def _inter_swap(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
     return assignments
 
 
-def _m5_total(assignments, cand_map, all_tasks, penalty):
-    """整解 M5 总成本（= 各分派 slot_cost 之和 + 未覆盖任务 penalty）。"""
-    total = 0.0
-    covered = set()
+def _inter_swap_ordered(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
+    """顺序接单模型的inter_swap（先排序再评估）"""
+    # 先排序
+    assignments = _sort_cids_score_asc(assignments, cand_map)
+
+    def slot_cost(tk, cids):
+        return _slot_cost_ordered(tk, cids, cand_map, penalty)
+
+    used = set()
     for tk, cids in assignments:
-        if not cids:
-            continue
-        first_c = cand_map.get((tk, cids[0]))
-        if not first_c:
-            continue
-        n = len(first_c["task_ids"])
-        p_rej = 1.0
-        sum_w = 0.0
-        sum_ws = 0.0
         for cid in cids:
-            c = cand_map.get((tk, cid))
-            if c:
-                p_rej *= (1 - c["willingness"])
-                sum_w += c["willingness"]
-                sum_ws += c["willingness"] * c["score"]
-        avg = sum_ws / sum_w if sum_w > 0 else 0.0
-        total += (1 - p_rej) * avg + p_rej * penalty * n
-        for t in first_c["task_ids"]:
-            covered.add(t)
-    total += (len(all_tasks) - len(covered)) * penalty
-    return total
+            used.add(cid)
+    free = set(all_couriers) - used
+
+    n_asgn = len(assignments)
+    improved = True
+    rounds = 0
+    while improved and rounds < 8:
+        improved = False
+        rounds += 1
+
+        for i in range(n_asgn):
+            tk_i, cids_i = assignments[i]
+            for j in range(n_asgn):
+                if i == j:
+                    continue
+                tk_j, cids_j = assignments[j]
+                ci_before = slot_cost(tk_i, cids_i)
+                cj_before = slot_cost(tk_j, cids_j)
+                base = ci_before + cj_before
+                done = False
+                for px in range(len(cids_i)):
+                    X = cids_i[px]
+                    if (tk_j, X) not in cand_map or X in cids_j:
+                        continue
+                    for py in range(len(cids_j)):
+                        Y = cids_j[py]
+                        if X == Y or (tk_i, Y) not in cand_map or Y in cids_i:
+                            continue
+                        cids_i[px], cids_j[py] = Y, X
+                        # 重新排序
+                        cids_i_sorted = sorted(cids_i, key=lambda cid: cand_map.get((tk_i, cid), {}).get("score", float("inf")))
+                        cids_j_sorted = sorted(cids_j, key=lambda cid: cand_map.get((tk_j, cid), {}).get("score", float("inf")))
+                        new_cost = _slot_cost_ordered(tk_i, cids_i_sorted, cand_map, penalty) + _slot_cost_ordered(tk_j, cids_j_sorted, cand_map, penalty)
+                        if new_cost < base - 1e-6:
+                            cids_i[:] = cids_i_sorted
+                            cids_j[:] = cids_j_sorted
+                            improved = True
+                            done = True
+                            break
+                        cids_i[px], cids_j[py] = X, Y
+                    if done:
+                        break
+                if done:
+                    continue
+                if len(cids_i) <= 1:
+                    continue
+                for px in range(len(cids_i)):
+                    X = cids_i[px]
+                    if (tk_j, X) not in cand_map or X in cids_j:
+                        continue
+                    removed = cids_i.pop(px)
+                    cids_j.append(X)
+                    cids_i_sorted = sorted(cids_i, key=lambda cid: cand_map.get((tk_i, cid), {}).get("score", float("inf")))
+                    cids_j_sorted = sorted(cids_j, key=lambda cid: cand_map.get((tk_j, cid), {}).get("score", float("inf")))
+                    new_cost = _slot_cost_ordered(tk_i, cids_i_sorted, cand_map, penalty) + _slot_cost_ordered(tk_j, cids_j_sorted, cand_map, penalty)
+                    if new_cost < base - 1e-6:
+                        cids_i[:] = cids_i_sorted
+                        cids_j[:] = cids_j_sorted
+                        improved = True
+                        break
+                    cids_j.pop()
+                    cids_i.insert(px, removed)
+
+        for j in range(n_asgn):
+            tk_j, cids_j = assignments[j]
+            cj_before = slot_cost(tk_j, cids_j)
+            best_gain = 0.0
+            best_X = None
+            for X in list(free):
+                if (tk_j, X) not in cand_map or X in cids_j:
+                    continue
+                cids_j.append(X)
+                cids_j_sorted = sorted(cids_j, key=lambda cid: cand_map.get((tk_j, cid), {}).get("score", float("inf")))
+                new_cost = _slot_cost_ordered(tk_j, cids_j_sorted, cand_map, penalty)
+                cids_j.pop()
+                gain = cj_before - new_cost
+                if gain > best_gain + 1e-6:
+                    best_gain = gain
+                    best_X = X
+            if best_X is not None:
+                cids_j.append(best_X)
+                cids_j.sort(key=lambda cid: cand_map.get((tk_j, cid), {}).get("score", float("inf")))
+                free.discard(best_X)
+                improved = True
+
+        for j in range(n_asgn):
+            tk_j, cids_j = assignments[j]
+            if len(cids_j) <= 1:
+                continue
+            cj_before = slot_cost(tk_j, cids_j)
+            for pos in range(len(cids_j) - 1, 0, -1):
+                removed = cids_j.pop(pos)
+                new_cost = slot_cost(tk_j, cids_j)
+                if new_cost < cj_before - 1e-6:
+                    free.add(removed)
+                    cj_before = new_cost
+                    improved = True
+                else:
+                    cids_insert = sorted(cids_j[:pos] + [removed] + cids_j[pos:],
+                                         key=lambda cid: cand_map.get((tk_j, cid), {}).get("score", float("inf")))
+                    cids_j[:] = cids_insert
+                    break
+
+    return assignments
 
 
-def _slot_cost(tk, cids, cand_map, penalty):
-    """单个分派的 M5 成本。"""
-    if not cids:
-        return 0.0
-    first_c = cand_map.get((tk, cids[0]))
-    if not first_c:
-        return 0.0
-    n = len(first_c["task_ids"])
-    p_rej = 1.0
-    sum_w = 0.0
-    sum_ws = 0.0
-    for cid in cids:
-        c = cand_map.get((tk, cid))
-        if c:
-            p_rej *= (1 - c["willingness"])
-            sum_w += c["willingness"]
-            sum_ws += c["willingness"] * c["score"]
-    avg = sum_ws / sum_w if sum_w > 0 else 0.0
-    return (1 - p_rej) * avg + p_rej * penalty * n
-
-
+# ============================================================
+# ALNS (两种模型版本)
+# ============================================================
 def _destroy_random(assignments, k, rng):
-    """随机移除 k 个分派；返回被移除的 (task_key, [cids]) 列表（用于复原）。"""
     n = len(assignments)
     if n == 0:
         return []
@@ -680,13 +814,27 @@ def _destroy_random(assignments, k, rng):
     return removed
 
 
-def _destroy_worst(assignments, k, cand_map, penalty):
-    """移除 M5 成本最高的 k 个分派（最有改进潜力的）。"""
+def _destroy_worst_ordered(assignments, k, cand_map, penalty):
     n = len(assignments)
     if n == 0:
         return []
     k = min(k, n)
-    costs = [(_slot_cost(tk, cids, cand_map, penalty), i)
+    costs = [(_slot_cost_ordered(tk, cids, cand_map, penalty), i)
+             for i, (tk, cids) in enumerate(assignments)]
+    costs.sort(reverse=True)
+    indices = [costs[i][1] for i in range(k)]
+    removed = []
+    for i in sorted(indices, reverse=True):
+        removed.append(assignments.pop(i))
+    return removed
+
+
+def _destroy_worst_weighted(assignments, k, cand_map, penalty):
+    n = len(assignments)
+    if n == 0:
+        return []
+    k = min(k, n)
+    costs = [(_slot_cost_weighted(tk, cids, cand_map, penalty), i)
              for i, (tk, cids) in enumerate(assignments)]
     costs.sort(reverse=True)
     indices = [costs[i][1] for i in range(k)]
@@ -697,8 +845,7 @@ def _destroy_worst(assignments, k, cand_map, penalty):
 
 
 def _repair_greedy(assignments, candidates, all_tasks, cand_map, penalty):
-    """对每个未覆盖任务，贪心选边际 M5 成本最低的合法候选作为 primary 加入。
-    不在已用骑手集合里、不与已覆盖任务冲突。"""
+    """贪心修复"""
     covered = set()
     used = set()
     for tk, cids in assignments:
@@ -723,7 +870,6 @@ def _repair_greedy(assignments, candidates, all_tasks, cand_map, penalty):
                 continue
             n = len(tids)
             w = c["willingness"]
-            # 单骑手分派的 M5 成本
             mc = w * c["score"] + (1 - w) * penalty * n
             if mc < best_cost:
                 best_cost = mc
@@ -737,42 +883,59 @@ def _repair_greedy(assignments, candidates, all_tasks, cand_map, penalty):
             uncovered.discard(t)
 
 
-def _alns(initial_assignments, candidates, all_tasks, all_couriers,
-          cand_map, taskkey_to_cands, penalty, deadline):
-    """ALNS 元启发式（destroy + repair + 模拟退火接受准则）。
-    起点是 v6a 的 best_assignments。用剩余时间反复扰动+重建+局部 polish，
-    SA 允许"变差"接受以跳出局部最优。整体逻辑：
-        loop until time up:
-            cand = copy(current)
-            destroy(cand, k)               # random or worst-cost
-            repair_greedy(cand)
-            cand = inter_swap(cand)         # polish 到局部最优
-            delta = cost(cand) - cost(current)
-            if delta < 0: accept; update best if improved
-            elif rand < exp(-delta/T): accept (climbing)
-            T *= cooling
-    """
-    import math
-    import random
-    import time
+def _add_backups_light(assignments, all_couriers, taskkey_to_cands, cand_map, penalty):
+    """轻量backup添加"""
+    used_couriers = set()
+    for tk, cids in assignments:
+        for cid in cids:
+            used_couriers.add(cid)
+
+    for idx, (tk, cids) in enumerate(assignments):
+        if len(cids) > 1:
+            continue
+        current_cost = _slot_cost_weighted(tk, cids, cand_map, penalty)
+        best_gain = 1e-6
+        best_cid = None
+        for c in taskkey_to_cands[tk]:
+            cid = c["courier_id"]
+            if cid in used_couriers:
+                continue
+            new_cids = cids + [cid]
+            new_cost = _slot_cost_weighted(tk, new_cids, cand_map, penalty)
+            gain = current_cost - new_cost
+            if gain > best_gain:
+                best_gain = gain
+                best_cid = cid
+        if best_cid is not None:
+            cids.append(best_cid)
+            used_couriers.add(best_cid)
+
+    return assignments
+
+
+def _alns_ordered(initial_assignments, candidates, all_tasks, all_couriers,
+                  cand_map, taskkey_to_cands, penalty, deadline):
+    """ALNS with ordered model"""
+    import math, random, time
 
     rng = random.Random(20260520)
 
     current = [(tk, list(cids)) for tk, cids in initial_assignments]
-    current_cost = _m5_total(current, cand_map, all_tasks, penalty)
+    current = _sort_cids_score_asc(current, cand_map)
+    current_cost = _m5_total_ordered(current, cand_map, all_tasks, penalty)
     best = [(tk, list(cids)) for tk, cids in current]
     best_cost = current_cost
-    # 计算起点覆盖任务集合；safe 模式拒绝任何降覆盖的候选
-    initial_covered = set()
+
+    initial_cov = set()
     for tk, cids in current:
         if cids:
             c = cand_map.get((tk, cids[0]))
             if c:
                 for t in c["task_ids"]:
-                    initial_covered.add(t)
-    initial_cov_count = len(initial_covered)
+                    initial_cov.add(t)
+    initial_cov_count = len(initial_cov)
 
-    def _cov_count(asgn):
+    def cov_count(asgn):
         cov = set()
         for tk, cids in asgn:
             if cids:
@@ -782,54 +945,103 @@ def _alns(initial_assignments, candidates, all_tasks, all_couriers,
                         cov.add(t)
         return len(cov)
 
-    # SA 参数：起始温度 ~ 当前 M5 的 2-3%；冷却率根据预期迭代数定
     T = max(5.0, best_cost * 0.025)
     T_min = 0.5
     cooling = 0.997
     n_assignments = len(current)
-    # 每次 destroy 5-12 个分派（大约 1/4 ~ 1/3 解）
     k_min = max(3, n_assignments // 8)
     k_max = max(k_min + 1, n_assignments // 3)
 
-    iter_count = 0
-    accepts = 0
-    improves = 0
     while time.time() < deadline - 0.2:
-        iter_count += 1
-        # 复制当前解
         cand = [(tk, list(cids)) for tk, cids in current]
-        # destroy
         k = rng.randint(k_min, k_max)
         if rng.random() < 0.5:
             _destroy_random(cand, k, rng)
         else:
-            _destroy_worst(cand, k, cand_map, penalty)
-        # repair：贪心补充未覆盖任务
+            _destroy_worst_ordered(cand, k, cand_map, penalty)
         _repair_greedy(cand, candidates, all_tasks, cand_map, penalty)
-        # polish：inter_swap 把候选打到其局部最优
-        cand = _inter_swap(cand, all_couriers, taskkey_to_cands, cand_map, penalty)
-        # 评估
-        cand_cost = _m5_total(cand, cand_map, all_tasks, penalty)
-        cand_cov = _cov_count(cand)
-        delta = cand_cost - current_cost
-        # safe 约束：覆盖任务数不允许低于起点
+        _add_backups_light(cand, all_couriers, taskkey_to_cands, cand_map, penalty)
+        cand = _sort_cids_score_asc(cand, cand_map)
+        cand = _inter_swap_ordered(cand, all_couriers, taskkey_to_cands, cand_map, penalty)
+
+        cand_cost = _m5_total_ordered(cand, cand_map, all_tasks, penalty)
+        cand_cov = cov_count(cand)
         if cand_cov < initial_cov_count:
-            continue  # 拒绝降覆盖的候选
-        # SA 接受准则
-        accept = False
-        if delta < 0:
-            accept = True
-        elif T > 0 and rng.random() < math.exp(-delta / T):
-            accept = True
-        if accept:
+            continue
+        delta = cand_cost - current_cost
+        if delta < 0 or (T > 0 and rng.random() < math.exp(-delta / T)):
             current = cand
             current_cost = cand_cost
-            accepts += 1
             if cand_cost < best_cost - 1e-6:
                 best = [(tk, list(cids)) for tk, cids in cand]
                 best_cost = cand_cost
-                improves += 1
-        # 冷却；T 跌到底就重新加热（避免后期完全单调）
+        T *= cooling
+        if T < T_min:
+            T = max(2.0, best_cost * 0.015)
+
+    return best
+
+
+def _alns_weighted(initial_assignments, candidates, all_tasks, all_couriers,
+                   cand_map, taskkey_to_cands, penalty, deadline):
+    """ALNS with weighted model"""
+    import math, random, time
+
+    rng = random.Random(20260521)
+
+    current = [(tk, list(cids)) for tk, cids in initial_assignments]
+    current_cost = _m5_total_weighted(current, cand_map, all_tasks, penalty)
+    best = [(tk, list(cids)) for tk, cids in current]
+    best_cost = current_cost
+
+    initial_cov = set()
+    for tk, cids in current:
+        if cids:
+            c = cand_map.get((tk, cids[0]))
+            if c:
+                for t in c["task_ids"]:
+                    initial_cov.add(t)
+    initial_cov_count = len(initial_cov)
+
+    def cov_count(asgn):
+        cov = set()
+        for tk, cids in asgn:
+            if cids:
+                c = cand_map.get((tk, cids[0]))
+                if c:
+                    for t in c["task_ids"]:
+                        cov.add(t)
+        return len(cov)
+
+    T = max(5.0, best_cost * 0.025)
+    T_min = 0.5
+    cooling = 0.997
+    n_assignments = len(current)
+    k_min = max(3, n_assignments // 8)
+    k_max = max(k_min + 1, n_assignments // 3)
+
+    while time.time() < deadline - 0.2:
+        cand = [(tk, list(cids)) for tk, cids in current]
+        k = rng.randint(k_min, k_max)
+        if rng.random() < 0.5:
+            _destroy_random(cand, k, rng)
+        else:
+            _destroy_worst_weighted(cand, k, cand_map, penalty)
+        _repair_greedy(cand, candidates, all_tasks, cand_map, penalty)
+        _add_backups_light(cand, all_couriers, taskkey_to_cands, cand_map, penalty)
+        cand = _inter_swap_weighted(cand, all_couriers, taskkey_to_cands, cand_map, penalty)
+
+        cand_cost = _m5_total_weighted(cand, cand_map, all_tasks, penalty)
+        cand_cov = cov_count(cand)
+        if cand_cov < initial_cov_count:
+            continue
+        delta = cand_cost - current_cost
+        if delta < 0 or (T > 0 and rng.random() < math.exp(-delta / T)):
+            current = cand
+            current_cost = cand_cost
+            if cand_cost < best_cost - 1e-6:
+                best = [(tk, list(cids)) for tk, cids in cand]
+                best_cost = cand_cost
         T *= cooling
         if T < T_min:
             T = max(2.0, best_cost * 0.015)
@@ -838,36 +1050,17 @@ def _alns(initial_assignments, candidates, all_tasks, all_couriers,
 
 
 def _expected_cost(assignments, cand_map, penalty):
-    """估算总期望代价（自洽指标，用于挑选最佳 penalty 候选）。"""
+    """兼容旧接口"""
     total = 0.0
     for tk, cids in assignments:
         if not cids:
             continue
-        first_c = cand_map.get((tk, cids[0]))
-        if not first_c:
-            continue
-        n_tasks = len(first_c["task_ids"])
-
-        p_rej = 1.0
-        sum_w = 0.0
-        sum_w_score = 0.0
-        for cid in cids:
-            c = cand_map.get((tk, cid))
-            if c:
-                w = c["willingness"]
-                p_rej *= (1 - w)
-                sum_w += w
-                sum_w_score += w * c["score"]
-
-        p_acc = 1 - p_rej
-        # 接单时的期望 score：按 willingness 加权平均（近似）
-        avg_score = (sum_w_score / sum_w) if sum_w > 0 else 0.0
-        total += p_acc * avg_score + p_rej * penalty * n_tasks
+        total += _slot_cost_weighted(tk, cids, cand_map, penalty)
     return total
 
 
 def _parse_input(input_text: str) -> list:
-    """解析输入数据。容忍 tab / 多空格 / 逗号分隔。"""
+    """解析输入数据"""
     import re
     text = input_text.lstrip("\ufeff")
     lines = text.strip().splitlines()
