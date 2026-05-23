@@ -132,6 +132,8 @@ def _solve_main(input_text: str) -> list:
     # 自适应策略和penalty
     strategies = ("global", "hard_first", "doubles_first")
     if is_low_w:
+        # v20: 低意愿场景增加willingness_first策略
+        strategies = ("global", "hard_first", "doubles_first", "willingness_first")
         penalties = (100, 200, 300)
     elif is_scarce:
         penalties = (60, 100, 150)
@@ -146,6 +148,8 @@ def _solve_main(input_text: str) -> list:
                 primary = _pick_primary_hard_first(candidates, all_tasks, penalty)
             elif primary_strategy == "doubles_first":
                 primary = _pick_primary_doubles_first(candidates, all_tasks, penalty)
+            elif primary_strategy == "willingness_first":
+                primary = _pick_primary_willingness_first(candidates, all_tasks)
             else:
                 primary = _pick_primary_random(candidates, all_tasks, penalty)
             primary = _rescue_coverage(primary, candidates, all_tasks, cand_map)
@@ -257,6 +261,33 @@ def _pick_primary_doubles_first(candidates, all_tasks, penalty):
     used_t = set()
     out = []
     for _, c in enriched:
+        if c["courier_id"] in used_c:
+            continue
+        if any(t in used_t for t in c["task_ids"]):
+            continue
+        out.append((c["task_key"], c["courier_id"]))
+        used_c.add(c["courier_id"])
+        for t in c["task_ids"]:
+            used_t.add(t)
+        if len(used_t) >= len(all_tasks):
+            break
+    return out
+
+
+def _pick_primary_willingness_first(candidates, all_tasks):
+    """v20: willingness优先策略，用于低意愿场景。
+    优先选高willingness骑手，即使score更高。
+    在willingness相同时，选score更低的。
+    """
+    enriched = []
+    for c in candidates:
+        # 按willingness降序、score升序排列
+        enriched.append((-c["willingness"], c["score"], c))
+    enriched.sort(key=lambda x: (x[0], x[1]))
+    used_c = set()
+    used_t = set()
+    out = []
+    for _, _, c in enriched:
         if c["courier_id"] in used_c:
             continue
         if any(t in used_t for t in c["task_ids"]):
